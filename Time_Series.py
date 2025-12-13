@@ -11,6 +11,7 @@ import math
 from datetime import datetime, timedelta
 import sys
 import os
+from processing_metrics import ProcessingMetrics
 
 # Initialize Earth Engine
 try:
@@ -39,6 +40,7 @@ class GridChlorophyllExtractor:
         self.end_date = end_date
         self.grid_coordinates = None
         self.time_series_data = None
+        self.metrics = ProcessingMetrics()
         
     def create_sampling_grid(self):
         """
@@ -79,6 +81,7 @@ class GridChlorophyllExtractor:
                 })
         
         self.grid_coordinates = grid_coords
+        self.metrics.total_grid_points = len(grid_coords)
         print(f"Grid created with {len(grid_coords)} points")
         return grid_coords
     
@@ -219,6 +222,17 @@ class GridChlorophyllExtractor:
             df = df.sort_values(['date', 'grid_id']).reset_index(drop=True)
             
             self.time_series_data = df
+            
+            # Track metrics: water_points and valid_pixels per date
+            for date in df['date'].dt.date.unique():
+                date_str = str(date)
+                date_data = df[df['date'].dt.date == date]
+                # water_points = number of grid points that returned data (were detected as water)
+                water_count = len(date_data)
+                self.metrics.add_water_points(date_str, water_count)
+                # valid_pixels = pixels with valid Rrs values (these are all valid since we filtered earlier)
+                self.metrics.add_valid_pixels(date_str, water_count)
+            
             print(f"\nExtracted {len(df)} valid observations across {df['grid_id'].nunique()} grid points")
             print(f"Date range: {df['date'].min()} to {df['date'].max()}")
             print(f"Unique dates: {df['date'].dt.date.nunique()}")
@@ -247,6 +261,7 @@ class GridChlorophyllExtractor:
         # Add chlorophyll columns
         chl_values = []
         class_values = []
+        outlier_flags = []  # Track outliers for metrics
         
         total_rows = len(self.time_series_data)
         
@@ -264,6 +279,7 @@ class GridChlorophyllExtractor:
                 if any(pd.isna(rrs_values)):
                     chl_values.append(np.nan)
                     class_values.append(np.nan)
+                    outlier_flags.append(False)  # Not an outlier, just missing data
                     continue
                 
                 # Convert to numpy array with correct shape (1, 5) for single pixel
@@ -280,20 +296,35 @@ class GridChlorophyllExtractor:
                 if chl_concentration > 100 or chl_concentration < 0:
                     chl_values.append(np.nan)
                     class_values.append(np.nan)
+                    outlier_flags.append(True)  # This is an outlier
                 else:
                     chl_values.append(chl_concentration)
                     class_values.append(water_class)
+                    outlier_flags.append(False)
                 
             except Exception as e:
                 print(f"Error calculating chlorophyll for row {idx}: {e}")
                 chl_values.append(np.nan)
                 class_values.append(np.nan)
+                outlier_flags.append(False)  # Error, not an outlier
         
         # Add to dataframe
         self.time_series_data['chlorophyll_a'] = chl_values
         self.time_series_data['water_class'] = class_values
+        self.time_series_data['_is_outlier'] = outlier_flags
         self.time_series_data['log_chl_a'] = np.log10(
             np.maximum(self.time_series_data['chlorophyll_a'], 0.01))
+        
+        # Track outliers per date for metrics
+        for date in self.time_series_data['date'].dt.date.unique():
+            date_str = str(date)
+            date_data = self.time_series_data[self.time_series_data['date'].dt.date == date]
+            outlier_count = date_data['_is_outlier'].sum()
+            if outlier_count > 0:
+                self.metrics.add_outliers_removed(date_str, int(outlier_count))
+        
+        # Remove temporary column
+        self.time_series_data = self.time_series_data.drop(columns=['_is_outlier'])
         
         valid_count = pd.notna(chl_values).sum()
         print(f"\n Calculated chlorophyll for {valid_count}/{total_rows} observations")
@@ -371,6 +402,11 @@ class GridChlorophyllExtractor:
             print(f"  Std Dev: {valid_chl.std():.3f} mg/m")
         
         print(f"{'='*60}\n")
+        
+        # Save processing metrics to JSON
+        metrics_path = os.path.join(output_dir, 'processing_metrics.json')
+        self.metrics.save(metrics_path)
+        self.metrics.print_summary()
         
         return exported_files
 
